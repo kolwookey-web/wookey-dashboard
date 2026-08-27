@@ -276,25 +276,31 @@ def build_radar(opener):
                 if rec["gm"]>old["gm"]: old["gm"]=rec["gm"]
                 if not old["day"] and rec["day"]: old["day"]=rec["day"]
     for sid,tab,has_meta in RADAR_OMSET:
-        sh=getsheet(sid)
-        if sh:
-            ws=pick(sh,tab)
-            if ws: read_om(ws,has_meta); print(f"[radar] Omset {sid[:6]}/{ws.title}: {len(omvid)} vid kumulatif")
+        try:
+            sh=getsheet(sid)
+            if sh:
+                ws=pick(sh,tab)
+                if ws: read_om(ws,has_meta); print(f"[radar] Omset {sid[:6]}/{ws.title}: {len(omvid)} vid kumulatif")
+        except Exception as e:
+            print(f"[WARN] radar Omset {sid[:6]} dilewati: {e}")
     # ---------- 2) JVT: dedup per ID Video ----------
     jvid={}
     for sid,tab in RADAR_JVT:
-        sh=getsheet(sid)
-        if not sh: continue
-        ws=pick(sh,tab)
-        if not ws: continue
-        v,hi,gi=_colmap(ws)
-        u_i=gi("Nama Kreator"); vid_i=gi("ID Video"); wk_i=gi("Waktu")
-        for r in v[hi+1:]:
-            def c(i): return (r[i].strip() if (i is not None and i<len(r)) else "")
-            vid=c(vid_i); u=c(u_i)
-            if not vid or not u: continue
-            if vid not in jvid: jvid[vid]={"u":u,"day":iso(c(wk_i))}
-        print(f"[radar] JVT {sid[:6]}/{ws.title}: {len(jvid)} vid kumulatif")
+        try:
+            sh=getsheet(sid)
+            if not sh: continue
+            ws=pick(sh,tab)
+            if not ws: continue
+            v,hi,gi=_colmap(ws)
+            u_i=gi("Nama Kreator"); vid_i=gi("ID Video"); wk_i=gi("Waktu")
+            for r in v[hi+1:]:
+                def c(i): return (r[i].strip() if (i is not None and i<len(r)) else "")
+                vid=c(vid_i); u=c(u_i)
+                if not vid or not u: continue
+                if vid not in jvid: jvid[vid]={"u":u,"day":iso(c(wk_i))}
+            print(f"[radar] JVT {sid[:6]}/{ws.title}: {len(jvid)} vid kumulatif")
+        except Exception as e:
+            print(f"[WARN] radar JVT {sid[:6]} dilewati: {e}")
     # ---------- 3) tanggal kontigu ----------
     alldays=set()
     for r in omvid.values():
@@ -303,6 +309,7 @@ def build_radar(opener):
         if r["day"]: alldays.add(r["day"])
     deal_rows=[]
     for sid,tab in RADAR_DEAL:
+      try:
         sh=getsheet(sid)
         if not sh: continue
         ws=pick(sh,tab)
@@ -316,6 +323,8 @@ def build_radar(opener):
             deal_rows.append({"u":u,"day":day,"pic":c(p_i)})
             alldays.add(day)
         print(f"[radar] Deal {sid[:6]}/{ws.title}: {len(deal_rows)} baris kumulatif")
+      except Exception as e:
+        print(f"[WARN] radar Deal {sid[:6]} dilewati: {e}")
     if not alldays:
         return None
     import datetime as _dt
@@ -441,11 +450,14 @@ def main():
     def _open(sid):
         if sid in sheets: return sheets[sid]
         return gc.open_by_key(sid)
-    D=build_radar(_open)
-    if D:
-        D["updated"]=stamp
-        json.dump(D,open("data/radar.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
-        print(f"[OK] radar.json: {len(D['creators'])} kreator, {len(D['dates'])} hari, {len(D['rows'])} baris")
+    try:
+        D=build_radar(_open)
+        if D:
+            D["updated"]=stamp
+            json.dump(D,open("data/radar.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
+            print(f"[OK] radar.json: {len(D['creators'])} kreator, {len(D['dates'])} hari, {len(D['rows'])} baris")
+    except Exception as e:
+        print(f"[WARN] radar.json GAGAL (tab KOL & lainnya tetap tersimpan): {e}")
 
 if __name__=="__main__":
     main()
