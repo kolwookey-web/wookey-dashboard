@@ -2,7 +2,7 @@
 """Update otomatis: baca HANYA sheet+tab tertentu dari master data, RAMPINGKAN kolom,
 lalu tulis JSON kecil ke data/. Juga tulis data/performa_video.json (siap-dashboard).
 Dipanggil GitHub Actions tiap 12:00 WIB."""
-import os, json, re, datetime
+import os, json, re, datetime, traceback, time
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -22,6 +22,22 @@ KEEP = ["pic","kategori","nama kreator","id kreator","id video","informasi video
         "klik produk","klik","gmv video","gmv","username","followers","ratecard","rate card",
         "jenis","type","status","deal","code"]
 MB = {'Jan':1,'Feb':2,'Mar':3,'Apr':4,'Mei':5,'Jun':6,'Jul':7,'Agu':8,'Agt':8,'Sep':9,'Okt':10,'Nov':11,'Des':12}
+
+def _retry(fn, tries=6, base=2):
+    """Coba ulang saat Google API error sementara (503/500/429/timeout) dgn jeda bertambah."""
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            m=str(e).lower()
+            transient=any(t in m for t in ('503','500','429','unavailable','rate limit','ratelimit','timed out','timeout','deadline','internal error'))
+            if i==tries-1 or not transient:
+                raise
+            wait=base*(2**i)
+            print(f"[retry] error sementara ({str(e)[:60]}), tunggu {wait}s lalu ulang ({i+1}/{tries})")
+            time.sleep(wait)
+def gav(ws):
+    return _retry(lambda: ws.get_all_values())
 
 def iso(s):
     s=str(s).strip()
@@ -48,7 +64,7 @@ def toi(v):
     return int(digits)
 
 def pick(sh,want):
-    wl=sh.worksheets()
+    wl=_retry(lambda: sh.worksheets())
     for w in wl:
         if w.title.strip().lower()==want.strip().lower(): return w
     for w in wl:
@@ -63,7 +79,7 @@ def keep_col(h):
     return any(k in hl for k in KEEP)
 
 def slim_tab(ws):
-    vals=ws.get_all_values()
+    vals=gav(ws)
     if not vals: return {"headers":[],"rows":[]}
     hi=hidx(vals); headers=[str(c).strip() for c in vals[hi]]
     cols=[j for j,h in enumerate(headers) if h and keep_col(h)]
@@ -78,7 +94,7 @@ def build_performa(sh):
     """Dedupe per ID Video (snapshot Tanggal Data terbaru) -> baris siap dashboard."""
     ws=pick(sh,"Data Omset VT 1 Juni 2026") or pick(sh,"Data Omset VT")
     if not ws: return []
-    vals=ws.get_all_values()
+    vals=gav(ws)
     if not vals: return []
     hi=hidx(vals); H={h.strip():i for i,h in enumerate(vals[hi])}
     def g(r,c):
@@ -119,7 +135,7 @@ def build_kol_result(sh):
     picmap={}
     dws=pick(sh,"Deal KOL")
     if dws:
-        v=dws.get_all_values(); hi,H,I=hmap(v)
+        v=gav(dws); hi,H,I=hmap(v)
         ui=(I.get("Username KOL") or I.get("UsernameKOL") or [None])[0]
         pi=(I.get("PIC") or [None])[0]
         if ui is not None and pi is not None:
@@ -130,7 +146,7 @@ def build_kol_result(sh):
     rows=[]
     def add(ws, src, pic_from_col):
         if not ws: return
-        v=ws.get_all_values(); hi,H,I=hmap(v)
+        v=gav(ws); hi,H,I=hmap(v)
         def gi(*names):
             for n in names:
                 if n in I: return I[n][0]
@@ -169,7 +185,7 @@ def build_kol_deal(sh):
     for tabn in ("Result KOL","Result Mega"):
         ws=pick(sh,tabn)
         if not ws: continue
-        v=ws.get_all_values(); hi,H,I=hmap(v)
+        v=gav(ws); hi,H,I=hmap(v)
         ui=(I.get("UsernameKOL") or I.get("Username KOL") or [None])[0]
         ji=(I.get("Jenis KOL") or [None])[0]
         if ui is None or ji is None: continue
@@ -178,7 +194,7 @@ def build_kol_deal(sh):
             if u and k and u not in catmap: catmap[u]=k
     ws=pick(sh,"Deal KOL")
     if not ws: return []
-    v=ws.get_all_values(); hi,H,I=hmap(v)
+    v=gav(ws); hi,H,I=hmap(v)
     def gi(*names):
         for n in names:
             if n in I: return I[n][0]
@@ -208,7 +224,7 @@ def build_kol_deal(sh):
     return rows
 
 def _colmap(ws):
-    v=ws.get_all_values(); hi,H,I=hmap(v)
+    v=gav(ws); hi,H,I=hmap(v)
     def gi(*names):
         for n in names:
             if n in I: return I[n][0]
@@ -414,42 +430,58 @@ def main():
     stamp=datetime.datetime.utcnow().replace(microsecond=0).isoformat()+"Z"
     sheets={}
     for src in SOURCES:
-        sh=gc.open_by_key(src["id"]); sheets[src["id"]]=sh
-        out={"updated":stamp,"tabs":{}}
-        for want in src["tabs"]:
-            ws=pick(sh,want)
-            if not ws:
-                out["tabs"][want]={"error":"tab tidak ditemukan","headers":[],"rows":[]}; continue
-            d=slim_tab(ws); out["tabs"][ws.title]=d
-            print(f"[OK] {src['out']}/{ws.title}: {len(d['rows'])} baris, {len(d['headers'])} kol")
-        json.dump(out,open(f"data/{src['out']}.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
+        try:
+            sh=_retry(lambda: gc.open_by_key(src["id"])); sheets[src["id"]]=sh
+            out={"updated":stamp,"tabs":{}}
+            for want in src["tabs"]:
+                ws=pick(sh,want)
+                if not ws:
+                    out["tabs"][want]={"error":"tab tidak ditemukan","headers":[],"rows":[]}; continue
+                d=slim_tab(ws); out["tabs"][ws.title]=d
+                print(f"[OK] {src['out']}/{ws.title}: {len(d['rows'])} baris, {len(d['headers'])} kol")
+            json.dump(out,open(f"data/{src['out']}.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
+        except Exception as e:
+            traceback.print_exc(); print(f"[WARN] sumber {src['out']} dilewati: {e}")
+    rows=[]
     # file siap-dashboard
-    rows=build_performa(sheets["17zqWC_OAsinyUzhVQmcnaLQiQJv6I8DRo4i9dVNKtC8"])
-    pv={"updated":stamp,"count":len(rows),"rows":rows}
-    json.dump(pv,open("data/performa_video.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
-    print(f"[OK] performa_video.json: {len(rows)} video unik")
+    try:
+        rows=build_performa(sheets["17zqWC_OAsinyUzhVQmcnaLQiQJv6I8DRo4i9dVNKtC8"])
+        pv={"updated":stamp,"count":len(rows),"rows":rows}
+        json.dump(pv,open("data/performa_video.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
+        print(f"[OK] performa_video.json: {len(rows)} video unik")
+    except Exception as e:
+        traceback.print_exc(); print(f"[WARN] performa_video.json dilewati: {e}")
     # KOL result (siap-dashboard: tab KOL)
-    krows=build_kol_result(sheets["1ETAp3hX_zJgoWzZBEq3kss3XdDs5Rl-d_65FClRYtRs"])
-    kr={"updated":stamp,"count":len(krows),"rows":krows}
-    json.dump(kr,open("data/kol_result.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
-    print(f"[OK] kol_result.json: {len(krows)} baris")
+    try:
+        krows=build_kol_result(sheets["1ETAp3hX_zJgoWzZBEq3kss3XdDs5Rl-d_65FClRYtRs"])
+        kr={"updated":stamp,"count":len(krows),"rows":krows}
+        json.dump(kr,open("data/kol_result.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
+        print(f"[OK] kol_result.json: {len(krows)} baris")
+    except Exception as e:
+        traceback.print_exc(); print(f"[WARN] kol_result.json dilewati: {e}")
     # KOL deal (kartu Deal)
-    drows=build_kol_deal(sheets["1ETAp3hX_zJgoWzZBEq3kss3XdDs5Rl-d_65FClRYtRs"])
-    dd={"updated":stamp,"count":len(drows),"rows":drows}
-    json.dump(dd,open("data/kol_deal.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
-    print(f"[OK] kol_deal.json: {len(drows)} baris")
+    try:
+        drows=build_kol_deal(sheets["1ETAp3hX_zJgoWzZBEq3kss3XdDs5Rl-d_65FClRYtRs"])
+        dd={"updated":stamp,"count":len(drows),"rows":drows}
+        json.dump(dd,open("data/kol_deal.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
+        print(f"[OK] kol_deal.json: {len(drows)} baris")
+    except Exception as e:
+        traceback.print_exc(); print(f"[WARN] kol_deal.json dilewati: {e}")
     # KOL performa (kartu Omset/Views) — subset kategori KOL dari performa video
-    KOLCAT={"KOL","Pareto","Spesial","Clipper","Berita"}
-    prows=[{"pd":r["pd"],"pic":r.get("pic",""),"cat":r.get("kat",""),
-            "view":r.get("view",0),"gmv":r.get("gmv",0),"vid":r.get("vid","")}
-           for r in rows if r.get("kat") in KOLCAT]
-    pp={"updated":stamp,"count":len(prows),"rows":prows}
-    json.dump(pp,open("data/kol_perf.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
-    print(f"[OK] kol_perf.json: {len(prows)} baris")
+    try:
+        KOLCAT={"KOL","Pareto","Spesial","Clipper","Berita"}
+        prows=[{"pd":r["pd"],"pic":r.get("pic",""),"cat":r.get("kat",""),
+                "view":r.get("view",0),"gmv":r.get("gmv",0),"vid":r.get("vid","")}
+               for r in rows if r.get("kat") in KOLCAT]
+        pp={"updated":stamp,"count":len(prows),"rows":prows}
+        json.dump(pp,open("data/kol_perf.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
+        print(f"[OK] kol_perf.json: {len(prows)} baris")
+    except Exception as e:
+        traceback.print_exc(); print(f"[WARN] kol_perf.json dilewati: {e}")
     # RADAR (tab Eksternal & Affiliate) — kompilasi struktur D dari SEMUA sheet Master Data
     def _open(sid):
         if sid in sheets: return sheets[sid]
-        return gc.open_by_key(sid)
+        return _retry(lambda: gc.open_by_key(sid))
     try:
         D=build_radar(_open)
         if D:
@@ -457,7 +489,12 @@ def main():
             json.dump(D,open("data/radar.json","w",encoding="utf-8"),ensure_ascii=False,separators=(",",":"))
             print(f"[OK] radar.json: {len(D['creators'])} kreator, {len(D['dates'])} hari, {len(D['rows'])} baris")
     except Exception as e:
-        print(f"[WARN] radar.json GAGAL (tab KOL & lainnya tetap tersimpan): {e}")
+        traceback.print_exc(); print(f"[WARN] radar.json GAGAL (tab KOL & lainnya tetap tersimpan): {e}")
 
 if __name__=="__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[FATAL] {e} — tapi selesai supaya data yg sudah tertulis tetap tersimpan.")
+        # exit 0 supaya workflow tetap commit data yg sudah jadi
